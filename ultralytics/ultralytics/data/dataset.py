@@ -37,6 +37,8 @@ from .utils import (
     verify_image,
     verify_image_label,
 )
+from fast_slic.avx2 import SlicAvx2 
+from scipy.interpolate import griddata
 
 # Ultralytics dataset *.cache version, >= 1.0.0 for YOLOv8
 DATASET_CACHE_VERSION = "1.0.3"
@@ -228,7 +230,6 @@ class YOLODataset(BaseDataset):
 
     @staticmethod
     def collate_fn(batch):
-        """Collates data samples into batches."""
         new_batch = {}
         keys = batch[0].keys()
         values = list(zip(*[list(b.values()) for b in batch]))
@@ -243,6 +244,7 @@ class YOLODataset(BaseDataset):
         for i in range(len(new_batch["batch_idx"])):
             new_batch["batch_idx"][i] += i  # add target image index for build_targets()
         new_batch["batch_idx"] = torch.cat(new_batch["batch_idx"], 0)
+
         return new_batch
 
 
@@ -277,6 +279,144 @@ class YOLOMultiModalDataset(YOLODataset):
             transforms.insert(-1, RandomLoadText(max_samples=min(self.data["nc"], 80), padding=True))
         return transforms
 
+class YOLOOccDataset(YOLODataset):
+    def __init__(self, *args, data=None, task="detect", **kwargs):
+        super().__init__(*args, data=data, task=task, **kwargs)
+        self.lidar_files = [path.replace("images", "velodynes").replace('.png','.bin') for path in self.im_files]
+        self.calib_files = [path.replace("images","calibs").replace('.png','.txt') for path in self.im_files]
+
+    def load_calib(self,index):
+        with open(self.calib_files[index], 'r') as f:
+            lines = f.readlines()
+        Tr_velo_to_cam = np.array([list(map(float, line.split()[1:])) for line in lines[5:6]])
+        Tr_velo_to_cam = np.hstack([Tr_velo_to_cam, np.array([[0, 0, 0, 1]])]).reshape(4,4)
+        return Tr_velo_to_cam
+
+    def load_point_cloud(self,index):
+        points = np.fromfile(self.lidar_files[index], dtype=np.float32).reshape(-1, 4)[:,:3]
+        ones = np.ones((points.shape[0], 1))
+        transform_mat = self.load_calib(index)
+        point_cam = np.hstack([points, ones]).dot(transform_mat.T)
+        return point_cam
+    
+    def load_depth_map(self,img_size,pcd,index):
+        h, w = img_size
+        with open(self.calib_files[index], 'r') as f:
+            lines = f.readlines()
+        K = np.array([list(map(float, line.split()[1:])) for line in lines[0:1]]).reshape(3,4)
+        xx, yy = np.meshgrid(np.arange(w), np.arange(h))
+        grid_coords = np.vstack((xx.flatten(), yy.flatten())).T
+        proj_points = np.dot(pcd, K.T)
+        u = proj_points[:, 0] / proj_points[:, 2]
+        v = proj_points[:, 1] / proj_points[:, 2]
+        z = proj_points[:, 2]
+        valid_mask = (u >= 0) & (u < w) & (v >= 0) & (v < h)
+        u, v = u[valid_mask], v[valid_mask]
+        z = z[valid_mask]
+        pcd_valid = np.vstack((u,v,z)).transpose(1,0)
+        depth_values = pcd[valid_mask, 2]
+        grid_coords_valid = np.column_stack((u, v))
+        depth_map = np.zeros((h, w), dtype=np.float32)
+        depth_map_flat = griddata(grid_coords_valid, depth_values, grid_coords, method='cubic', fill_value=0)
+        depth_map = depth_map_flat.reshape(h, w)
+        return pcd_valid, depth_map
+
+    def get_image_and_label(self, index):
+        label = super().get_image_and_label(index)
+        point_cloud = self.load_point_cloud(index)
+        valid_pcd,depth_map = self.load_depth_map(label['ori_shape'], point_cloud, index)
+        label['pcd'] = torch.Tensor(valid_pcd)
+        img = label['img']
+        slic = SlicAvx2(num_components=32*32,compactness=10)
+        assignment = slic.iterate(img)
+        dassignment = slic.iterate(np.repeat(depth_map[...,np.newaxis].astype(np.uint8), 3, axis=-1))
+        label['spixel'] = torch.Tensor(pad_to_square_numpy(assignment,target_size=max(label['resized_shape']),pad_val=-1)).unsqueeze(0).repeat(3,1,1)
+        label['dspixel'] = torch.Tensor(pad_to_square_numpy(dassignment,target_size=max(label['resized_shape']),pad_val=-1)).unsqueeze(0).repeat(3,1,1)
+        label['depth'] = torch.Tensor(pad_to_square_numpy(depth_map,target_size=max(label['resized_shape']),pad_val=0)).repeat(3,1,1)
+        return label
+
+    def build_transforms(self, hyp=None):
+        # TODO: @VE Check augment
+        self.augment = False
+        transforms = super().build_transforms(hyp)
+        return transforms
+    
+    @staticmethod
+    def collate_fn(batch):
+        # img = batch[0]['img']
+        # assignment = batch[0]['spixel']
+        # vis_img = visualize_spixel(img.cpu().numpy().transpose(1,2,0),assignment)
+        # cv2.imwrite('debug.jpg',vis_img)
+        new_batch = {}
+        keys = batch[0].keys()
+        values = list(zip(*[list(b.values()) for b in batch]))
+        for i, k in enumerate(keys):
+            value = values[i]
+            if k == "pcd":
+                max_npoints = max([pcd.shape[0] for pcd in value])
+                padded_points = []
+                for point in value:
+                    num_points = point.shape[0]
+                    if num_points < max_npoints:
+                        padding = torch.zeros((max_npoints - num_points, 3))
+                        padded_point = torch.cat([point, padding], dim=0)
+                    else:
+                        padded_point = point
+                    padded_points.append(padded_point)
+                value = torch.stack(padded_points, dim=0)
+            if k == "spixel":
+                value = torch.stack(value, 0)
+            if k == "dspixel":
+                value = torch.stack(value, 0)
+            if k == "depth":
+                value = torch.stack(value, 0)
+            if k == "img":
+                value = torch.stack(value, 0)
+            if k in {"masks", "keypoints", "bboxes", "cls", "segments", "obb"}:
+                value = torch.cat(value, 0)
+            new_batch[k] = value
+        new_batch["batch_idx"] = list(new_batch["batch_idx"])
+        for i in range(len(new_batch["batch_idx"])):
+            new_batch["batch_idx"][i] += i  # add target image index for build_targets()
+        new_batch["batch_idx"] = torch.cat(new_batch["batch_idx"], 0)
+        return new_batch
+
+def pad_to_square_numpy(image, target_size=640, pad_val=-1):
+        h, w = image.shape[:2]
+        pad_h = max(0, target_size - h)
+        pad_w = max(0, target_size - w)
+        pad_top = pad_h // 2
+        pad_bottom = pad_h - pad_top
+        pad_left = pad_w // 2
+        pad_right = pad_w - pad_left
+        if len(image.shape) == 3:
+            padded_image = np.pad(
+                image,
+                ((pad_top, pad_bottom), (pad_left, pad_right), (0, 0)),
+                mode='constant',
+                constant_values=pad_val
+            )
+        else:
+            padded_image = np.pad(
+                image,
+                ((pad_top, pad_bottom), (pad_left, pad_right)),
+                mode='constant',
+                constant_values=pad_val
+            )
+        return padded_image
+
+def visualize_spixel(img, labels):
+    H, W, _ = img.shape
+    colored_image = np.zeros((H, W, 3), dtype=np.uint8)
+    unique_labels = np.unique(labels)
+    colors = np.random.randint(0, 255, size=(len(unique_labels), 3), dtype=np.uint8)
+    
+    for i, label in enumerate(unique_labels):
+        colored_image[labels == label] = colors[i]
+    
+    alpha = 0.6
+    overlaid_image = cv2.addWeighted(img, 1 - alpha, colored_image, alpha, 0)
+    return overlaid_image
 
 class GroundingDataset(YOLODataset):
     """Handles object detection tasks by loading annotations from a specified JSON file, supporting YOLO format."""

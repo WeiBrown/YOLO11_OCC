@@ -89,6 +89,9 @@ try:
 except ImportError:
     thop = None
 
+from torchvision import models
+
+
 
 class BaseModel(nn.Module):
     """The BaseModel class serves as a base class for all the models in the Ultralytics YOLO family."""
@@ -286,6 +289,7 @@ class BaseModel(nn.Module):
             batch (dict): Batch to compute loss on
             preds (torch.Tensor | List[torch.Tensor]): Predictions.
         """
+        # import ipdb;ipdb.set_trace()
         if getattr(self, "criterion", None) is None:
             self.criterion = self.init_criterion()
 
@@ -596,6 +600,67 @@ class RTDETRDetectionModel(DetectionModel):
         x = head([y[j] for j in head.f], batch)  # head inference
         return x
 
+
+class OccModel(DetectionModel):
+    def __init__(self,cfg="yolo11n-occ.yaml", ch=3, nc=None, verbose=True):
+        self.dfe = None
+        self.pcdfe = None
+        self.spfe = None
+        self.dspfe = None
+        self.embed = None
+        super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
+        # import ipdb;ipdb.set_trace()
+
+    def predict(self, x, pcd=None, spixel=None, dspixel=None, depth=None, profile=False, visualize=False, augment=False, embed=None):
+        # import ipdb;ipdb.set_trace()
+        if augment:
+            # TODO: @VE Augment predict
+            return self._predict_augment(x)
+        return self._predict_once(x, pcd, spixel, dspixel, depth, profile, visualize, embed)
+
+    def _predict_once(self, x, pcd=None, spixel=None, dspixel=None, depth=None, profile=False, visualize=False, embed=None):
+        # import ipdb;ipdb.set_trace()
+        y, dt, embeddings = [], [], []  # outputs
+        for m in self.model:
+            if m.f != -1:  # if not from previous layer
+                x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
+            if profile:
+                self._profile_one_layer(m, x, dt)
+            x = m(x)  # run
+            y.append(x if m.i in self.save else None)  # save output
+            if visualize:
+                feature_visualization(x, m.type, m.i, save_dir=visualize)
+            if embed and m.i in embed:
+                embeddings.append(nn.functional.adaptive_avg_pool2d(x, (1, 1)).squeeze(-1).squeeze(-1))  # flatten
+                if m.i == max(embed):
+                    return torch.unbind(torch.cat(embeddings, 1), dim=0)
+    
+        # if self.dfe and self.spfe and self.dspfe and self.pcdfe and self.embed:
+        #     pcdf = self.pcdfe(pcd)
+        #     sf = self.spfe(spixel)
+        #     dsf = self.dspfe(dspixel)
+        #     df = self.dfe(depth)
+        #     fm = self.embed(x,pcdf,sf,dsf,df)
+        #     return fm
+            
+            
+        return x
+
+    def loss(self, batch, preds=None):
+        """
+        Compute loss.
+
+        Args:
+            batch (dict): Batch to compute loss on.
+            preds (torch.Tensor | List[torch.Tensor]): Predictions.
+        """
+        # import ipdb;ipdb.set_trace()
+        if not hasattr(self, "criterion"):
+            self.criterion = self.init_criterion()
+
+        if preds is None:
+            preds = self.forward(batch["img"], pcd=batch["pcd"], spixel=batch["spixel"], dspixel=batch["dspixel"], depth=batch["depth"])
+        return self.criterion(preds, batch)
 
 class WorldModel(DetectionModel):
     """YOLOv8 World Model."""
